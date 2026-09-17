@@ -139,6 +139,10 @@ ffmpeg -f lavfi -i "gradients=s=320x64:c0=black:c1=white:x0=0:y0=0:x1=320:y1=0" 
 termcast --cols 64 /tmp/grad.mp4 > /tmp/out.txt
 ```
 
+## License
+
+MIT. See [LICENSE](LICENSE).
+
 ## Status
 
 Developed and tested on macOS (Apple silicon) against ffmpeg 8.1, with

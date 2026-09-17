@@ -3,6 +3,8 @@ name = "termcast"
 version = "0.1.0"
 edition = "2021"
 description = "A terminal media player for mp4 and webm"
+license = "MIT"
+repository = "https://github.com/hunterhu777/termcast"
 
 [dependencies]
 ffmpeg-next = "8.1"
