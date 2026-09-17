@@ -148,3 +148,7 @@ MIT. See [LICENSE](LICENSE).
 Developed and tested on macOS (Apple silicon) against ffmpeg 8.1, with
 h264/mp4, hevc/mp4, AV1/webm, and audio-only mp3. The dependencies
 (`cpal`, `crossterm`) are cross-platform but other platforms are untested.
+
+## AI use
+
+This is a vibe-coded project, but the main architectural design is mine.
