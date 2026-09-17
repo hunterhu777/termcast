@@ -24,14 +24,18 @@ use std::time::{Duration, Instant};
 struct Args {
     /// Media file (mp4, webm, mkv, mov, mp3, ...)
     file: String,
-    /// Use the ASCII ramp instead of half-blocks
+    /// Render in colour. The default is black and white.
     #[arg(long)]
-    ascii: bool,
-    /// Render without colour (implies --ascii)
+    color: bool,
+    /// Use half-block rendering: U+2580 with independent foreground and
+    /// background puts two pixels in every cell, doubling vertical resolution.
+    /// Needs a terminal that draws the glyph without seams. Combine with
+    /// --color for full colour, or leave it off for greyscale.
     #[arg(long)]
-    mono: bool,
-    /// With --ascii, also paint a per-cell background. Doubles escape traffic;
-    /// worth it on terminals that cannot render U+2580 for half-blocks.
+    half_block: bool,
+    /// Paint a per-cell background in the ASCII renderer, so each cell
+    /// integrates to the pixel's true luminance. Roughly doubles escape
+    /// traffic in exchange for a near-linear tone response.
     #[arg(long)]
     ascii_bg: bool,
     /// Do not open an audio device
@@ -54,6 +58,11 @@ struct Args {
     /// Cap the render width in characters
     #[arg(long)]
     cols: Option<u16>,
+    /// Cap presented frames per second. The lever against a terminal that
+    /// cannot composite fast enough -- it reduces repaints, which is what
+    /// actually costs, rather than bytes.
+    #[arg(long, value_name = "N")]
+    fps: Option<f64>,
     /// Keep the terminal's own background instead of painting the render area
     /// black. Use this to preserve a transparent or themed background.
     #[arg(long)]
@@ -95,7 +104,11 @@ fn run() -> Result<()> {
 
     let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let truecolor = term::truecolor();
-    let use_ascii = args.ascii || args.mono || !is_tty;
+    // Colour is opt-in; honour the NO_COLOR convention even if --color is given.
+    let colour = args.color && std::env::var_os("NO_COLOR").is_none();
+    // Half-blocks need a real terminal: when stdout is redirected we stream
+    // plain rows, where one glyph per cell is the only sensible shape.
+    let use_ascii = !args.half_block || !is_tty;
 
     // ---- audio ---------------------------------------------------------
     let mut audio_out = None;
@@ -124,9 +137,9 @@ fn run() -> Result<()> {
     }
 
     let mut renderer: Box<dyn Renderer> = if use_ascii {
-        Box::new(render::ascii::Ascii::new(truecolor, !args.mono, args.ascii_bg))
+        Box::new(render::ascii::Ascii::new(truecolor, colour, args.ascii_bg))
     } else {
-        Box::new(render::halfblock::HalfBlock::new(truecolor))
+        Box::new(render::halfblock::HalfBlock::new(truecolor, colour))
     };
     renderer.set_sequential(!is_tty);
     // Black, not grey: a space is the ramp's darkest glyph, so this colour is
@@ -154,8 +167,10 @@ fn run() -> Result<()> {
         // also true for the initial --start seek
         rebase: Arc::new(AtomicBool::new(true)),
         decode_us: Arc::new(AtomicU64::new(0)),
+        producer_drops: Arc::new(AtomicU64::new(0)),
     };
     let decode_us = shared.decode_us.clone();
+    let producer_drops = shared.producer_drops.clone();
     let (quit, eof, generation, rebase) = (
         shared.quit.clone(),
         shared.eof.clone(),
@@ -189,11 +204,14 @@ fn run() -> Result<()> {
     let mut show_stats = args.stats;
     let mut dropped = 0u64;
     let mut shown = 0u64;
+    let mut throttled = 0u64;
+    let mut last_shown_pts: Option<f64> = None;
+    let min_pts_gap = args.fps.filter(|f| *f > 0.0).map(|f| 1.0 / f);
     let mut write_ms = 0.0f64;
     let mut log = match &args.stats_log {
         Some(path) => {
             let mut f = BufWriter::new(File::create(path)?);
-            writeln!(f, "wall_s,pts_s,drift_ms,draw_ms,write_ms,decode_ms,bytes,shown,dropped,px_w,px_h")?;
+            writeln!(f, "wall_s,pts_s,drift_ms,draw_ms,write_ms,decode_ms,bytes,shown,dropped,pdrops,throttled,px_w,px_h")?;
             Some(f)
         }
         None => None,
@@ -266,6 +284,7 @@ fn run() -> Result<()> {
                             clock.reset(to);
                             rebase.store(true, Ordering::Relaxed);
                             pending = None;
+                            last_shown_pts = None;
                             let _ = ctx_tx.send(media::Cmd::Seek(to));
                             renderer.invalidate();
                         }
@@ -332,6 +351,16 @@ fn run() -> Result<()> {
             continue;
         }
 
+        // --fps: skip ahead without rendering. Draining the frame rather than
+        // sleeping on it keeps the channel moving, so the media thread never
+        // parks on a full queue.
+        if let (Some(gap), Some(last)) = (min_pts_gap, last_shown_pts) {
+            if frame.pts - last < gap - 0.001 {
+                throttled += 1;
+                continue;
+            }
+        }
+
         let drift = frame.pts - clock.now();
         let dt = drift;
         if dt > 0.002 {
@@ -354,6 +383,7 @@ fn run() -> Result<()> {
         renderer.draw(&frame.data, frame.w, frame.h, &mut out);
         let draw_ms = t_draw.elapsed().as_secs_f64() * 1000.0;
         shown += 1;
+        last_shown_pts = Some(frame.pts);
         if args.panic_after == Some(shown) {
             panic!("deliberate panic after {shown} frames (--panic-after)");
         }
@@ -363,13 +393,15 @@ fn run() -> Result<()> {
             let stat_line = frame.pts - clock.now();
             let _ = write!(
                 out,
-                "\x1b[2;1H\x1b[0m drift {:+6.1}ms drop {} shown {} draw {:.2}ms write {:.2}ms dec {:.2}ms {}x{} ",
+                "\x1b[2;1H\x1b[0m drift {:+6.1}ms drop {} shown {} draw {:.2}ms write {:.2}ms dec {:.2}ms pdrop {} thr {} {}x{} ",
                 stat_line * 1000.0,
                 dropped,
                 shown,
                 draw_ms,
                 write_ms,
                 decode_us.load(Ordering::Relaxed) as f64 / 1000.0,
+                producer_drops.load(Ordering::Relaxed),
+                throttled,
                 frame.w,
                 frame.h
             );
@@ -388,7 +420,7 @@ fn run() -> Result<()> {
         if let Some(f) = log.as_mut() {
             let _ = writeln!(
                 f,
-                "{:.3},{:.3},{:+.2},{:.3},{:.3},{:.3},{},{},{},{},{}",
+                "{:.3},{:.3},{:+.2},{:.3},{:.3},{:.3},{},{},{},{},{},{},{}",
                 started.elapsed().as_secs_f64(),
                 frame.pts,
                 drift * 1000.0,
@@ -398,6 +430,8 @@ fn run() -> Result<()> {
                 nbytes,
                 shown,
                 dropped,
+                producer_drops.load(Ordering::Relaxed),
+                throttled,
                 frame.w,
                 frame.h
             );
@@ -438,8 +472,12 @@ fn run() -> Result<()> {
         };
         let total: usize = samples.iter().map(|s| s.3).sum();
         eprintln!(
-            "\ntermcast: {} frames shown, {} dropped, {:.1}s wall",
-            shown, dropped, elapsed
+            "\ntermcast: {} shown, {} dropped late, {} dropped by producer, {} throttled, {:.1}s wall",
+            shown,
+            dropped,
+            producer_drops.load(Ordering::Relaxed),
+            throttled,
+            elapsed
         );
         for (name, i) in [("draw  ", 0), ("write ", 1), ("decode", 2)] {
             eprintln!(

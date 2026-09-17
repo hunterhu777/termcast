@@ -7,12 +7,19 @@ use super::{Cell, Grid, Renderer};
 
 pub struct HalfBlock {
     grid: Grid,
+    colour: bool,
 }
 
 impl HalfBlock {
-    pub fn new(truecolor: bool) -> Self {
-        Self { grid: Grid::new(truecolor) }
+    pub fn new(truecolor: bool, colour: bool) -> Self {
+        Self { grid: Grid::new(truecolor), colour }
     }
+}
+
+#[inline]
+fn grey(p: &[u8]) -> [u8; 3] {
+    let l = ((p[0] as u32 * 299 + p[1] as u32 * 587 + p[2] as u32 * 114) / 1000) as u8;
+    [l, l, l]
 }
 
 impl Renderer for HalfBlock {
@@ -22,6 +29,7 @@ impl Renderer for HalfBlock {
         self.grid.resize(cols, rows);
         let (wu, hu) = (w as usize, h as usize);
         let stride = wu * 3;
+        let colour = self.colour;
         for y in 0..rows as usize {
             let ty = 2 * y;
             let by = (2 * y + 1).min(hu - 1); // odd heights reuse the last row
@@ -33,10 +41,14 @@ impl Renderer for HalfBlock {
                 .zip(t.chunks_exact(3))
                 .zip(b.chunks_exact(3))
             {
-                *cell = Cell {
-                    ch: '\u{2580}',
-                    fg: [tp[0], tp[1], tp[2]],
-                    bg: Some([bp[0], bp[1], bp[2]]),
+                *cell = if colour {
+                    Cell {
+                        ch: '\u{2580}',
+                        fg: [tp[0], tp[1], tp[2]],
+                        bg: Some([bp[0], bp[1], bp[2]]),
+                    }
+                } else {
+                    Cell { ch: '\u{2580}', fg: grey(tp), bg: Some(grey(bp)) }
                 };
             }
         }

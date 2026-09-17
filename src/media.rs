@@ -111,6 +111,10 @@ pub struct Shared {
     /// Microseconds spent in decode + swscale for the last video frame, so the
     /// media thread's CPU cost can be told apart from the render loop's.
     pub decode_us: Arc<AtomicU64>,
+    /// Frames discarded by the producer because the consumer was too far
+    /// behind. Counted separately from consumer-side drops: these mean the
+    /// render loop is the bottleneck, not the clock.
+    pub producer_drops: Arc<AtomicU64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,6 +188,9 @@ pub fn spawn(
         // roughly one second of audio; also the backpressure valve for the whole
         // pipeline, since a paused device stops draining it
         let cap = (out_rate as usize) * (out_ch as usize);
+        // 250ms of audio: below this the queue is close enough to empty that
+        // feeding it takes priority over delivering a video frame
+        let low_water = cap / 4;
 
         // std's Receiver cannot be peeked, and the inner retry loops must not
         // swallow commands, so drained commands land here until the top of the
@@ -277,7 +284,14 @@ pub fn spawn(
                             gen: shared.generation.load(Ordering::Relaxed),
                             data: pack_rgb(&rgb),
                         };
-                        // bounded send, but stay responsive to quit/seek
+                        // A full video channel is the normal, healthy state:
+                        // decoding outruns real time, so parking here IS the
+                        // back-pressure that paces the pipeline. What must
+                        // never happen is parking long enough to starve the
+                        // audio queue -- that stalls the clock, which disables
+                        // the consumer-side drop logic and turns a slow
+                        // terminal into slow playback. So the condition to
+                        // bail on is audio running dry, not elapsed attempts.
                         loop {
                             match vtx.try_send(frame) {
                                 Ok(()) => break,
@@ -290,6 +304,18 @@ pub fn spawn(
                                         cmdq.push(c);
                                     }
                                     if !cmdq.is_empty() {
+                                        break;
+                                    }
+                                    let audio_low = match &audio_q {
+                                        Some(q) => q.lock().unwrap().len() < low_water,
+                                        // no audio track: the wall clock keeps
+                                        // advancing, so parking cannot stall it
+                                        None => false,
+                                    };
+                                    if audio_low {
+                                        shared
+                                            .producer_drops
+                                            .fetch_add(1, Ordering::Relaxed);
                                         break;
                                     }
                                     std::thread::sleep(Duration::from_millis(2));
