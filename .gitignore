@@ -1,1 +1,24 @@
 /target
+
+# Media: sources and generated test fixtures. Large and/or third-party;
+# regenerate with the ffmpeg commands in the README.
+*.webm
+*.mp4
+*.m4v
+*.mkv
+*.mov
+*.avi
+*.mp3
+*.m4a
+*.aac
+*.opus
+*.ogg
+*.wav
+*.aiff
+*.flac
+*.ppm
+
+# Profiling output from --stats-log
+*.csv
+
+.DS_Store
